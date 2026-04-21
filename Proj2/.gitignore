@@ -1,0 +1,7 @@
+*.txt
+*.zip
+*.mov
+*.ini
+
+images/*
+colmap-x64-windows-cuda/*
