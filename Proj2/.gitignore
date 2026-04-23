@@ -5,3 +5,10 @@
 
 images/*
 colmap-x64-windows-cuda/*
+
+Images/*
+output/*
+showcase/*
+colmap/*
+
+*.mp4

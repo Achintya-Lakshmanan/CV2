@@ -1,26 +1,27 @@
+
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-import glob
+import os
 
+np.random.seed(42)
 
 def fit_plane(points):
     p1, p2, p3 = points
     v1 = p2 - p1
     v2 = p3 - p1
-    n = np.cross(v1, v2)
-    if np.linalg.norm(n) == 0:
+    normal = np.cross(v1, v2)
+    if np.linalg.norm(normal) == 0:
         return None
-    a, b, c = n
-    d = -np.dot(n, p1)
+    a, b, c = normal
+    d = -np.dot(normal, p1)
     return a, b, c, d
-
 
 def point_to_plane_distance(point, plane):
     a, b, c, d = plane
     x, y, z = point
-    return abs(a * x + b * y + c * z + d) / np.linalg.norm([a, b, c])
-
+    numerator = abs(a * x + b * y + c * z + d)
+    denominator = np.linalg.norm([a, b, c])
+    return numerator / denominator
 
 def ransac_plane(points, threshold=0.01, max_iterations=2000):
     n_points = points.shape[0]
@@ -43,7 +44,6 @@ def local_coordinate(inlier_points, plane):
     centroid = np.mean(inlier_points, axis=0)
     normal = np.array(plane[:3])
     z_axis = normal / np.linalg.norm(normal)
-
     arbitrary_vector = np.array([1, 0, 0]) if abs(z_axis[0]) < 0.9 else np.array([0, 1, 0])
     x_axis = np.cross(arbitrary_vector, z_axis)
     x_axis /= np.linalg.norm(x_axis)
@@ -54,9 +54,7 @@ def local_coordinate(inlier_points, plane):
     global_points = local_points @ R.T + centroid
     return local_points, global_points
 
-
-def load_and_transform_icosahedron(filename, scene_centroid, scene_R, scale=1.0, anchor='face_center'):
-    verts = []
+def load_and_transform_icosahedron(filename, scene_centroid, scene_R, scale=0.35, anchor='face_center', x_offset=0.0, y_offset=0.0, z_offset=0.0):
     verts = []
     with open(filename, 'r') as f:
         for line in f:
@@ -64,21 +62,12 @@ def load_and_transform_icosahedron(filename, scene_centroid, scene_R, scale=1.0,
                 parts = line.strip().split()
                 verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
     verts = np.array(verts)
-    z0 = np.isclose(verts[:,2], 0)
-    z0 = np.isclose(verts[:,2], 0)
-    bottom_indices = np.where(z0)[0]
-    bottom_face_verts = verts[bottom_indices]
-    bottom_face_verts = verts[bottom_indices]
-    if anchor == 'face_center':
-        anchor_point = np.mean(bottom_face_verts, axis=0)
-    else:
-        anchor_point = bottom_face_verts[0]
-    verts_centered = (verts - anchor_point) * scale
-    verts_centered = (verts - anchor_point) * scale
-    ico_vertices_scene = verts_centered @ scene_R.T + scene_centroid
+    verts_centered = verts.copy() * scale
+    verts_centered[:,0] += x_offset
+    verts_centered[:,1] += y_offset
+    verts_centered[:,2] += z_offset
     ico_vertices_scene = verts_centered @ scene_R.T + scene_centroid
     return ico_vertices_scene
-
 
 def parse_colmap_camera(filename):
     with open(filename, 'r') as f:
@@ -126,19 +115,20 @@ def project_points_pinhole(XYZ, K, R, t):
     return np.stack([u, v], axis=1)
 
 def overlay_mesh_on_image(image, verts2d, faces, depths, color=(0,255,0), alpha=0.5):
-    import cv2
     img = image.copy()
     order = np.argsort(depths)[::-1]
     for idx in order:
         pts = verts2d[faces[idx]].astype(np.int32)
         overlay = img.copy()
         cv2.fillPoly(overlay, [pts], color)
+        cv2.polylines(overlay, [pts], isClosed=True, color=(0,0,0), thickness=1)
         img = cv2.addWeighted(overlay, alpha, img, 1-alpha, 0)
     return img
 
 def save_images_as_video(image_paths, output_path, fps=10):
-    import cv2
     img = cv2.imread(image_paths[0])
+    if img is None:
+        return
     height, width, _ = img.shape
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -148,13 +138,13 @@ def save_images_as_video(image_paths, output_path, fps=10):
             out.write(img)
     out.release()
 
-# --- MAIN PIPELINE EXAMPLE ---
 
-
-def run_ar_pipeline_video():
-    import glob
+def run_ar_pipeline_video(run_dir="run_1", fps=5, x_offset=0.0, y_offset=0.0, z_offset=0.0):
+    out_dir = os.path.join('output', run_dir)
+    colmap_dir = os.path.join('colmap', run_dir)
+    img_dir = os.path.join('Images', run_dir)
     pts = []
-    with open('points3D.txt', 'r') as f:
+    with open(os.path.join(colmap_dir, 'points3D.txt'), 'r') as f:
         for line in f:
             if line.startswith('#') or line.strip() == '':
                 continue
@@ -163,17 +153,29 @@ def run_ar_pipeline_video():
                 continue
             pts.append([float(parts[1]), float(parts[2]), float(parts[3])])
     pts = np.array(pts)
-    plane, inlier_idx = ransac_plane(pts)
-    inliers = pts[inlier_idx]
+    if len(pts) < 10:
+        return
+    plane, inliers_local = ransac_plane(pts, threshold=0.01, max_iterations=2000)
+    if plane is None:
+        return
+    cam = parse_colmap_camera(os.path.join(colmap_dir, 'cameras.txt'))
+    if cam is None:
+        return
+    images = parse_colmap_images(os.path.join(colmap_dir, 'images.txt'))
+    if not images:
+        return
+    images.sort(key=lambda x: x['image_name'])
+    K = np.array([[cam['fx'], 0, cam['cx']], [0, cam['fx'], cam['cy']], [0,0,1]])
+    color = (0, 255, 0)
+    inliers = pts[inliers_local]
     centroid = np.mean(inliers, axis=0)
     normal = np.array(plane[:3])
-
     z_axis = normal / np.linalg.norm(normal)
     ref = np.array([1,0,0]) if abs(z_axis[0]) < 0.9 else np.array([0,1,0])
     x_axis = np.cross(ref, z_axis); x_axis /= np.linalg.norm(x_axis)
     y_axis = np.cross(z_axis, x_axis); y_axis /= np.linalg.norm(y_axis)
     R_scene = np.stack([x_axis, y_axis, z_axis], axis=1)
-    ico_scene = load_and_transform_icosahedron('icosahedron.txt', centroid, R_scene, scale=0.5, anchor='face_center')
+    ico_scene = load_and_transform_icosahedron('icosahedron.txt', centroid, R_scene, scale=0.35, anchor='face_center', x_offset=x_offset, y_offset=y_offset, z_offset=z_offset)
     faces = []
     with open('icosahedron.txt', 'r') as f:
         for line in f:
@@ -181,27 +183,34 @@ def run_ar_pipeline_video():
                 idx = [int(x)-1 for x in line.strip().split()[1:]]
                 faces.append(idx)
     faces = np.array(faces)
-    cam = parse_colmap_camera('cameras.txt')
-    images = parse_colmap_images('images.txt')
-    K = np.array([[cam['fx'], 0, cam['cx']], [0, cam['fx'], cam['cy']], [0,0,1]])
     overlay_paths = []
     for img_info in images:
         q = img_info['q']
         t = np.array(img_info['t'])
         R = quaternion_to_rotation_matrix(q)
-        img_path = f"Images/{img_info['image_name']}"
+        img_basename = os.path.basename(img_info['image_name'])
+        img_path = os.path.join(img_dir, img_basename)
         img = cv2.imread(img_path)
         if img is None:
-            print(f"Image not found: {img_path}")
             continue
         verts2d = project_points_pinhole(ico_scene, K, R, t)
         ico_cam = (R @ ico_scene.T + t.reshape(3,1)).T
         depths = np.min(ico_cam[faces,2], axis=1)
-        img_overlay = overlay_mesh_on_image(img, verts2d, faces, depths, color=(0,255,0), alpha=0.5)
-        out_path = f"overlay_{img_info['image_name']}"
+        img_overlay = overlay_mesh_on_image(img, verts2d, faces, depths, color=color, alpha=0.5)
+        out_path = os.path.join(out_dir, f"overlay_{img_basename}")
         cv2.imwrite(out_path, img_overlay)
         overlay_paths.append(out_path)
-    save_images_as_video(overlay_paths, 'output.mp4', fps=5)
+    save_images_as_video(overlay_paths, os.path.join(out_dir, 'output.mp4'), fps=fps)
+
 
 if __name__ == "__main__":
-    run_ar_pipeline_video()
+    import sys
+    import argparse
+    parser = argparse.ArgumentParser(description='Run AR pipeline video with local icosahedron offset.')
+    parser.add_argument('run_dir', nargs='?', default='run_1', help='Run directory')
+    parser.add_argument('--fps', type=int, default=5, help='Frames per second for video')
+    parser.add_argument('--x_offset', type=float, default=0.0, help='Local X offset for icosahedron')
+    parser.add_argument('--y_offset', type=float, default=0.0, help='Local Y offset for icosahedron')
+    parser.add_argument('--z_offset', type=float, default=0.0, help='Local Z offset for icosahedron')
+    args = parser.parse_args()
+    run_ar_pipeline_video(args.run_dir, fps=args.fps, x_offset=args.x_offset, y_offset=args.y_offset, z_offset=args.z_offset)
